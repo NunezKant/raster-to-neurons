@@ -20,7 +20,6 @@ import h5py
 from scipy.interpolate import interp1d
 import pandas as pd
 from datetime import datetime, timedelta
-import streamlit as st
 
 ##### SUITE2P FUNCTIONS #####
 
@@ -375,6 +374,15 @@ def get_movement_df(MouseObject):
             1 - Movementdf.loc[Movementdf["distance"] > 75, "distance"] / 10 * alpha_dx
         ),
     )
+    Movementdf['distance_interp'] = np.nan
+    Movementdf['vel_interp'] = np.nan
+    for trial in Movementdf.trial.unique():
+        distance = Movementdf.query(f'trial == {trial}')['distance']
+        pitch = Movementdf.query(f'trial == {trial}')['pitch']
+        roll = Movementdf.query(f'trial == {trial}')['roll']
+        vel = np.sqrt(pitch**2 + roll**2)
+        Movementdf.loc[Movementdf["trial"]==trial,'vel_interp'] = vel.cumsum()
+        Movementdf.loc[Movementdf["trial"]==trial,'distance_interp'] = distance + (trial-1)*150
     return Movementdf
 
 
@@ -484,7 +492,7 @@ def get_frametypes(MouseObject, color=True):
     return trial_type_byframe
 
 #### FRAME SELECTOR #####
-def get_fremeselector(MouseObject):
+def get_fremeselector(MouseObject , effective_frames = True):
     reward_delivery_frame = np.round(
         MouseObject._timestamps["reward_frames"][
             np.isnan(MouseObject._timestamps["reward_frames"]) == False
@@ -498,8 +506,7 @@ def get_fremeselector(MouseObject):
             "velocity": MouseObject._timestamps["run"][: MouseObject._spks.shape[1]],
             "distance": MouseObject._timestamps["distance"][
                 : MouseObject._spks.shape[1]
-            ]
-            * 10,
+            ],
             "reward_delivery": np.nan,
             "ordinal_time": MouseObject._timestamps["frame_times"][: MouseObject._spks.shape[1]],
         }
@@ -533,7 +540,10 @@ def get_fremeselector(MouseObject):
     FrameSelector["time_within_trial"] = np.nan
     for trial in trials:
         FrameSelector.loc[FrameSelector["trial_no"] == trial, "time_within_trial"] = FrameSelector.loc[FrameSelector["trial_no"] == trial, "time_fromstart"] - FrameSelector.loc[FrameSelector["trial_no"] == trial, "time_fromstart"].iloc[0]
-    FrameSelector = FrameSelector.drop(columns=["ordinal_time"])
+        FrameSelector.loc[FrameSelector["trial_no"] == trial, "distance"] = np.abs(FrameSelector.loc[FrameSelector["trial_no"] == trial, "distance"] - (150 * (FrameSelector.loc[FrameSelector["trial_no"] == trial, "trial_no"]-1)))
+    FrameSelector = FrameSelector.drop(columns=["ordinal_time"]) 
+    if effective_frames == True:
+        FrameSelector = FrameSelector.loc[~pd.isnull(FrameSelector)['trial_no']]
     return FrameSelector
 
 
@@ -601,6 +611,25 @@ def get_trialno_bytype(FrameSelector):
         trialno = trialno - 1
         trial_type_dict[trial_type] = trialno
     return trial_type_dict
+
+def superneuron_toneurons(isort_vect,clust_idxs,spn_binsize):
+    """
+    convert superneuron index to individual neuron index
+
+    Parameters:
+    isort_vect: isort vector from rastermap
+    clust_idxs: tuple of (start, end) cluster index
+    spn_binsize: number of neurons per superneuron
+
+    Returns: 
+    selected_neurons: list of neuron indices
+    """
+
+    nsuper = len(isort_vect)//spn_binsize
+    assert clust_idxs[1] <= nsuper, "clustidx[1] should be smaller than number of superneurons"
+    assert clust_idxs[0] >= 0, "clustidx[0] should be larger than 0"
+    selected_neurons = isort_vect[clust_idxs[0]*spn_binsize:(clust_idxs[1]+1)*spn_binsize]
+    return selected_neurons
 
 @dataclass
 class Mouse:
@@ -803,14 +832,18 @@ class Mouse:
                 "data_var or _timeline not loaded, make sure to load them first by self.load_behav()"
             )
 
-        # what frame number does each trial start on?
+        # what frame number does each trial start on? 
         ttrial = self._timeline["Movement"][4]
-        istart = np.argwhere(np.diff(ttrial) > 0.5).flatten()
+        istart = np.argwhere(np.diff(ttrial) > 0.5).flatten() + 1
+        frameidx_first_trial = np.where(self._timeline["Movement"][5] > tframes.min())[0][0]
+        istart = np.insert(istart,0,frameidx_first_trial) # insert frameidx_first_trial in first position
         tstart = self._timeline["Movement"][5][istart]
+
+        # get trial start frames
         trial_frames = interp1d(tframes, np.arange(1, nframes + 1))(
             tstart
-        )  # trial start frames
-
+        )  
+        df = get_movement_df(self)
         # interpolate running speed for each neural frame
         runsp = (
             self._timeline["Movement"][0] ** 2 + self._timeline["Movement"][1] ** 2
@@ -819,12 +852,11 @@ class Mouse:
         run = interp1d(trun, runsp, fill_value="extrapolate")(tframes)
 
         # interpolate running speed for each neural frame
-        distance = self._timeline["Movement"][3]
+        distance = df["distance_interp"].values
         trun = self._timeline["Movement"][5]
         dist = interp1d(trun, distance, fill_value="extrapolate")(tframes)
 
         # interpolate alpha values for each neural frame
-        df = get_movement_df(self)
         alpha = df.alpha.values
         trun = self._timeline["Movement"][5]
         alpha_interp = interp1d(trun, alpha, fill_value="extrapolate")(tframes)
@@ -880,19 +912,21 @@ class Mouse:
         """
         try:
             ttrial = self._timeline["Movement"][4]
-            istart = np.argwhere(np.diff(ttrial) > 0.5).flatten()
+            istart = np.argwhere(np.diff(ttrial) > 0.5).flatten() + 1
+            frameidx_first_trial = np.where(self._timeline["Movement"][5] > self._timestamps["frame_times"].min())[0][0]
+            istart = np.insert(istart,0,frameidx_first_trial) # insert frameidx_first_trial in first position
             tstart = self._timeline["Movement"][5][istart]
         except NameError:
             print(
-                "data_var or _timeline not loaded, make sure to load them first by self.load_behav()"
+                "data_var, _timeline or _timestamps not loaded, make sure to load them first by self.load_behav() and self.get_timestamps()"
             )
 
         # get the trial type for each trial
         ntrials = len(tstart)
         trial_type = self._timeline["TrialRewardStrct"].flatten()[:ntrials]
         trial_new = self._timeline["TrialNewTextureStrct"].flatten()[:ntrials]
-        trial_type = np.roll(trial_type, -1)
-        trial_new = np.roll(trial_new, -1)
+        #trial_type = np.roll(trial_type, -1)
+        #trial_new = np.roll(trial_new, -1)
         trial_info = {
             "isrewarded": trial_type,
             "istest": trial_new,
